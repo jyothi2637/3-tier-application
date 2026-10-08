@@ -1,7 +1,7 @@
 import axios from "axios";
 
 const api = axios.create({
-  baseURL: "http://3.111.197.146:5001/api"
+  baseURL: "http://ems-backend-alb-2015390660.ap-south-1.elb.amazonaws.com/api"
 });
 
 api.interceptors.request.use((config)=>{

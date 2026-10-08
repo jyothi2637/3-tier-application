@@ -1,62 +1,210 @@
 pipeline {
     agent any
 
+    environment {
+        AWS_REGION = 'ap-south-1'
+        AWS_ACCOUNT_ID = '820329009041'
+
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+        FRONTEND_REPO = 'ems-frontend'
+        BACKEND_REPO  = 'ems-backend'
+
+        ECS_CLUSTER = 'ems-cluster'
+
+        FRONTEND_SERVICE = 'ems-frontend-service'
+        BACKEND_SERVICE  = 'ems-backend-service'
+
+        FRONTEND_TASK_FAMILY = 'ems-frontend-task'
+        BACKEND_TASK_FAMILY  = 'ems-backend-task'
+    }
+
     stages {
-        stage('Hello') {
+
+        stage('Checkout') {
             steps {
-                echo 'Hello World'
+                git branch: 'main',
+                    url: 'https://github.com/jyothi2637/3-tier-application.git'
             }
         }
-        
-        stage("Cloning repo"){
-            steps{
-                echo "clonig repo in local"
-                git url: "https://github.com/pranitdhekane/ems-react-nodejs-mysql.git", branch:"main"
-            }
-            
-        }
-        
-        stage("building Images"){
-            steps{
+
+        stage('Verify Tools') {
+            steps {
                 sh '''
-                whoami
-                ls
-                docker build -t ems-frontend:latest frontend/.
-                docker build -t ems-backend:latest backend/.
+                    aws --version
+                    docker --version
+                    jq --version
                 '''
-            }    
-        }
-        
-        stage("Pushing image to docker hub"){
-            
-            steps{
-                echo "pushing image to dockerhub"
-                sh "docker tag ems-frontend:latest dpranit/ems-frontend:v1"
-                sh "docker tag ems-backend:latest dpranit/ems-backend:v1"
-                withCredentials([usernamePassword(credentialsId:"dockerhubcred",
-            passwordVariable:"dockerhubpass",
-            usernameVariable:"dockerhubusername")]){
-               
-               sh "docker login -u ${env.dockerhubusername} -p ${env.dockerhubpass}"
-               sh "docker push dpranit/ems-frontend:v1"
-               sh "docker push dpranit/ems-backend:v1"
-            }  
-                   
             }
-            
         }
-        
-        stage("deploying app"){
-            
-            steps{
-                
-                echo "Delpoying app"
-                sh "docker compose up -d"
-                
+
+        stage('Build Docker Images') {
+            steps {
+                sh '''
+                    docker build -t ${FRONTEND_REPO}:${BUILD_NUMBER} ./frontend
+                    docker build -t ${BACKEND_REPO}:${BUILD_NUMBER} ./backend
+                '''
             }
-            
         }
-        
-     }
-     
+
+        stage('Login to ECR') {
+            steps {
+                sh '''
+                    aws ecr get-login-password --region ${AWS_REGION} |
+                    docker login \
+                    --username AWS \
+                    --password-stdin ${ECR_REGISTRY}
+                '''
+            }
+        }
+
+        stage('Push Images to ECR') {
+            steps {
+                sh '''
+                    docker tag ${FRONTEND_REPO}:${BUILD_NUMBER} \
+                    ${ECR_REGISTRY}/${FRONTEND_REPO}:${BUILD_NUMBER}
+
+                    docker tag ${BACKEND_REPO}:${BUILD_NUMBER} \
+                    ${ECR_REGISTRY}/${BACKEND_REPO}:${BUILD_NUMBER}
+
+                    docker push \
+                    ${ECR_REGISTRY}/${FRONTEND_REPO}:${BUILD_NUMBER}
+
+                    docker push \
+                    ${ECR_REGISTRY}/${BACKEND_REPO}:${BUILD_NUMBER}
+                '''
+            }
+        }
+
+        stage('Create Frontend Task Definition') {
+            steps {
+                sh '''
+                    aws ecs describe-task-definition \
+                    --task-definition ${FRONTEND_TASK_FAMILY} \
+                    --region ${AWS_REGION} \
+                    --query taskDefinition \
+                    --output json > frontend-task.json
+
+                    jq --arg IMAGE \
+                    "${ECR_REGISTRY}/${FRONTEND_REPO}:${BUILD_NUMBER}" \
+                    '.containerDefinitions[0].image=$IMAGE |
+                    del(
+                        .taskDefinitionArn,
+                        .revision,
+                        .status,
+                        .requiresAttributes,
+                        .compatibilities,
+                        .registeredAt,
+                        .registeredBy,
+                        .enableFaultInjection
+                    )' \
+                    frontend-task.json > frontend-task-new.json
+
+                    aws ecs register-task-definition \
+                    --cli-input-json file://frontend-task-new.json \
+                    --region ${AWS_REGION} \
+                    --query 'taskDefinition.taskDefinitionArn' \
+                    --output text > frontend-task-arn.txt
+                '''
+            }
+        }
+
+        stage('Create Backend Task Definition') {
+            steps {
+                sh '''
+                    aws ecs describe-task-definition \
+                    --task-definition ${BACKEND_TASK_FAMILY} \
+                    --region ${AWS_REGION} \
+                    --query taskDefinition \
+                    --output json > backend-task.json
+
+                    jq --arg IMAGE \
+                    "${ECR_REGISTRY}/${BACKEND_REPO}:${BUILD_NUMBER}" \
+                    '.containerDefinitions[0].image=$IMAGE |
+                    del(
+                        .taskDefinitionArn,
+                        .revision,
+                        .status,
+                        .requiresAttributes,
+                        .compatibilities,
+                        .registeredAt,
+                        .registeredBy,
+                        .enableFaultInjection
+                    )' \
+                    backend-task.json > backend-task-new.json
+
+                    aws ecs register-task-definition \
+                    --cli-input-json file://backend-task-new.json \
+                    --region ${AWS_REGION} \
+                    --query 'taskDefinition.taskDefinitionArn' \
+                    --output text > backend-task-arn.txt
+                '''
+            }
+        }
+
+        stage('Update ECS Services') {
+            steps {
+                sh '''
+                    FRONTEND_TASK=$(cat frontend-task-arn.txt)
+                    BACKEND_TASK=$(cat backend-task-arn.txt)
+
+                    aws ecs update-service \
+                    --cluster ${ECS_CLUSTER} \
+                    --service ${FRONTEND_SERVICE} \
+                    --task-definition "$FRONTEND_TASK" \
+                    --region ${AWS_REGION}
+
+                    aws ecs update-service \
+                    --cluster ${ECS_CLUSTER} \
+                    --service ${BACKEND_SERVICE} \
+                    --task-definition "$BACKEND_TASK" \
+                    --region ${AWS_REGION}
+                '''
+            }
+        }
+
+        stage('Verify ECS Deployment') {
+            steps {
+                sh '''
+                    echo "Waiting for frontend deployment..."
+
+                    aws ecs wait services-stable \
+                    --cluster ${ECS_CLUSTER} \
+                    --services ${FRONTEND_SERVICE} \
+                    --region ${AWS_REGION}
+
+                    echo "Waiting for backend deployment..."
+
+                    aws ecs wait services-stable \
+                    --cluster ${ECS_CLUSTER} \
+                    --services ${BACKEND_SERVICE} \
+                    --region ${AWS_REGION}
+
+                    echo "ECS deployment completed successfully."
+                '''
+            }
+        }
+    }
+
+    post {
+
+        always {
+            sh '''
+                rm -f frontend-task.json
+                rm -f frontend-task-new.json
+                rm -f frontend-task-arn.txt
+                rm -f backend-task.json
+                rm -f backend-task-new.json
+                rm -f backend-task-arn.txt
+            '''
+        }
+
+        success {
+            echo 'CI/CD deployment completed successfully!'
+        }
+
+        failure {
+            echo 'CI/CD deployment failed. Check the Jenkins console output.'
+        }
+    }
 }
